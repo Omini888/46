@@ -1,0 +1,985 @@
+use std::io::Cursor;
+use std::sync::OnceLock;
+
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use image::{ImageFormat, RgbaImage};
+use lopdf::{
+    content::{Content, Operation},
+    Dictionary, Document, Object, ObjectId,
+};
+use tiny_skia::{
+    Color, FillRule, FilterQuality, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint,
+    PixmapRef, Stroke, StrokeDash, Transform,
+};
+use tracing::debug;
+
+use crate::pdf_images::decode_pdf_image_to_dynamic;
+
+/// Кэшированный системный шрифт (если доступен на машине) для подписи осей и цифр на чертежах
+static SYSTEM_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+
+fn get_optional_font() -> Option<&'static FontVec> {
+    SYSTEM_FONT
+        .get_or_init(|| {
+            let mut candidates = Vec::new();
+            if let Ok(custom_path) = std::env::var("PDF_FONT_PATH") {
+                candidates.push(custom_path);
+            }
+            candidates.extend([
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".to_string(),
+                "/usr/share/fonts/TTF/DejaVuSans.ttf".to_string(),
+                "/usr/share/fonts/liberation/LiberationSans-Regular.ttf".to_string(),
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf".to_string(),
+                "/usr/share/fonts/truetype/freefont/FreeSans.ttf".to_string(),
+                "C:\\Windows\\Fonts\\arial.ttf".to_string(),
+                "C:\\Windows\\Fonts\\tahoma.ttf".to_string(),
+            ]);
+
+            for path in candidates {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(font) = FontVec::try_from_vec(bytes) {
+                        debug!("Загружен шрифт для рендеринга PDF: {}", path);
+                        return Some(font);
+                    }
+                }
+            }
+            None
+        })
+        .as_ref()
+}
+
+/// 2D аффинная матрица [a, b, c, d, e, f] в формате спецификации PDF:
+/// x' = a * x + c * y + e
+/// y' = b * x + d * y + f
+#[derive(Clone, Copy, Debug)]
+struct Affine2D {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Affine2D {
+    fn identity() -> Self {
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// Композиция матриц: применить сначала `m`, затем `self` (соответствует оператору `cm` в PDF)
+    fn pre_concat(&self, m: Self) -> Self {
+        Self {
+            a: self.a * m.a + self.c * m.b,
+            b: self.b * m.a + self.d * m.b,
+            c: self.a * m.c + self.c * m.d,
+            d: self.b * m.c + self.d * m.d,
+            e: self.a * m.e + self.c * m.f + self.e,
+            f: self.b * m.e + self.d * m.f + self.f,
+        }
+    }
+
+    /// Преобразование точки (x, y) из координат PDF в пиксельные координаты холста
+    fn map_point(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    /// Средний коэффициент масштабирования (для расчёта толщины линий и кегля шрифта)
+    fn scale_factor(&self) -> f32 {
+        let sx = (self.a * self.a + self.b * self.b).sqrt();
+        let sy = (self.c * self.c + self.d * self.d).sqrt();
+        ((sx + sy) * 0.5).max(0.1)
+    }
+
+    fn to_skia_transform(&self) -> Option<Transform> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-7 || !det.is_finite() {
+            return None;
+        }
+        let t = Transform::from_row(self.a, self.b, self.c, self.d, self.e, self.f);
+        if t.sx.is_finite() && t.sy.is_finite() && t.tx.is_finite() && t.ty.is_finite() {
+            Some(t)
+        } else {
+            None
+        }
+    }
+}
+
+/// Состояние графики PDF (сохраняется и восстанавливается операторами `q` и `Q`)
+#[derive(Clone, Debug)]
+struct PdfGraphicsState {
+    ctm: Affine2D,
+    stroke_color: Color,
+    fill_color: Color,
+    line_width: f32,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    dash_array: Vec<f32>,
+    dash_phase: f32,
+    text_matrix: Affine2D,
+    text_line_matrix: Affine2D,
+    font_size: f32,
+    text_leading: f32,
+}
+
+impl PdfGraphicsState {
+    fn new(initial_ctm: Affine2D) -> Self {
+        Self {
+            ctm: initial_ctm,
+            stroke_color: Color::BLACK,
+            fill_color: Color::BLACK,
+            line_width: 1.0,
+            line_cap: LineCap::Butt,
+            line_join: LineJoin::Miter,
+            dash_array: Vec::new(),
+            dash_phase: 0.0,
+            text_matrix: Affine2D::identity(),
+            text_line_matrix: Affine2D::identity(),
+            font_size: 10.0,
+            text_leading: 12.0,
+        }
+    }
+}
+
+/// Рендерит страницу PDF (`page_num`, начиная с 1) в PNG-изображение средствами чистого Rust.
+/// Рисует векторные чертежи, линии, кривые, таблицы, вложенные формы и растровые изображения.
+pub fn render_page_pure_rust(doc: &Document, page_num: u32, dpi: f32) -> Option<Vec<u8>> {
+    let pages = doc.get_pages();
+    let &page_id = pages.get(&page_num)?;
+
+    // 1. Определяем гео-рамку страницы (MediaBox / CropBox)
+    let (llx, lly, urx, ury) = get_page_media_box(doc, page_id).unwrap_or((0.0, 0.0, 595.28, 841.89));
+    let pdf_w = (urx - llx).abs().max(1.0);
+    let pdf_h = (ury - lly).abs().max(1.0);
+
+    let scale = (dpi / 72.0).clamp(0.5, 4.0);
+    let px_w = ((pdf_w * scale).round() as u32).clamp(64, 4096);
+    let px_h = ((pdf_h * scale).round() as u32).clamp(64, 4096);
+
+    let mut pixmap = Pixmap::new(px_w, px_h)?;
+    pixmap.fill(Color::WHITE);
+
+    // Матрица перехода из координат PDF (ось Y вверх) в пиксели холста (ось Y вниз)
+    let initial_ctm = Affine2D {
+        a: scale,
+        b: 0.0,
+        c: 0.0,
+        d: -scale,
+        e: -llx * scale,
+        f: ury * scale,
+    };
+
+    // 2. Получаем словарь ресурсов страницы и декодируем поток команд
+    let page_resources = get_page_resources(doc, page_id);
+    let content_bytes = doc.get_page_content(page_id).ok()?;
+    let content = Content::decode(&content_bytes).ok()?;
+
+    let mut state = PdfGraphicsState::new(initial_ctm);
+    let mut state_stack: Vec<PdfGraphicsState> = Vec::with_capacity(16);
+
+    render_operations(
+        doc,
+        &content.operations,
+        page_resources,
+        &mut pixmap,
+        &mut state,
+        &mut state_stack,
+        0,
+    );
+
+    // 3. Кодируем полученный Pixmap в PNG через крейт image
+    let rgba_img = RgbaImage::from_raw(px_w, px_h, pixmap.take())?;
+    let mut png_bytes = Vec::new();
+    rgba_img
+        .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
+        .ok()?;
+
+    debug!(
+        "Страница {} отрендерена на чистом Rust ({}x{} пикс., {} байт PNG)",
+        page_num,
+        px_w,
+        px_h,
+        png_bytes.len()
+    );
+
+    Some(png_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_operations(
+    doc: &Document,
+    operations: &[Operation],
+    resources: Option<&Dictionary>,
+    pixmap: &mut Pixmap,
+    state: &mut PdfGraphicsState,
+    state_stack: &mut Vec<PdfGraphicsState>,
+    depth: u8,
+) {
+    if depth > 6 {
+        return;
+    }
+
+    let mut pb = PathBuilder::new();
+    let mut cur_pt: (f32, f32) = (0.0, 0.0);
+    let mut subpath_start: (f32, f32) = (0.0, 0.0);
+    let mut has_path = false;
+
+    for op in operations {
+        let args = &op.operands;
+        match op.operator.as_str() {
+            // ================================================================
+            // УПРАВЛЕНИЕ СОСТОЯНИЕМ И МАТРИЦАМИ (q, Q, cm, w, J, j, d)
+            // ================================================================
+            "q" => {
+                if state_stack.len() < 64 {
+                    state_stack.push(state.clone());
+                }
+            }
+            "Q" => {
+                if let Some(prev) = state_stack.pop() {
+                    *state = prev;
+                }
+            }
+            "cm" => {
+                if let Some(m) = parse_matrix(args) {
+                    state.ctm = state.ctm.pre_concat(m);
+                }
+            }
+            "w" => {
+                if let Some(w) = obj_to_f32(args.first()) {
+                    state.line_width = w.max(0.0);
+                }
+            }
+            "J" => {
+                if let Some(cap) = obj_to_i64(args.first()) {
+                    state.line_cap = match cap {
+                        1 => LineCap::Round,
+                        2 => LineCap::Square,
+                        _ => LineCap::Butt,
+                    };
+                }
+            }
+            "j" => {
+                if let Some(join) = obj_to_i64(args.first()) {
+                    state.line_join = match join {
+                        1 => LineJoin::Round,
+                        2 => LineJoin::Bevel,
+                        _ => LineJoin::Miter,
+                    };
+                }
+            }
+            "d" => {
+                if args.len() >= 2 {
+                    if let Object::Array(arr) = &args[0] {
+                        state.dash_array = arr
+                            .iter()
+                            .filter_map(|o| obj_to_f32(Some(o)))
+                            .filter(|&v| v > 0.0)
+                            .collect();
+                    }
+                    state.dash_phase = obj_to_f32(args.get(1)).unwrap_or(0.0).max(0.0);
+                }
+            }
+
+            // ================================================================
+            // ЦВЕТА ОБВОДКИ И ЗАЛИВКИ (G, g, RG, rg, K, k, SC, sc, SCN, scn)
+            // ================================================================
+            "G" => {
+                if let Some(g) = obj_to_f32(args.first()) {
+                    state.stroke_color = gray_to_color(g);
+                }
+            }
+            "g" => {
+                if let Some(g) = obj_to_f32(args.first()) {
+                    state.fill_color = gray_to_color(g);
+                }
+            }
+            "RG" => {
+                if let (Some(r), Some(g), Some(b)) = (
+                    obj_to_f32(args.first()),
+                    obj_to_f32(args.get(1)),
+                    obj_to_f32(args.get(2)),
+                ) {
+                    state.stroke_color = rgb_to_color(r, g, b);
+                }
+            }
+            "rg" => {
+                if let (Some(r), Some(g), Some(b)) = (
+                    obj_to_f32(args.first()),
+                    obj_to_f32(args.get(1)),
+                    obj_to_f32(args.get(2)),
+                ) {
+                    state.fill_color = rgb_to_color(r, g, b);
+                }
+            }
+            "K" => {
+                if let (Some(c), Some(m), Some(y), Some(k)) = (
+                    obj_to_f32(args.first()),
+                    obj_to_f32(args.get(1)),
+                    obj_to_f32(args.get(2)),
+                    obj_to_f32(args.get(3)),
+                ) {
+                    state.stroke_color = cmyk_to_color(c, m, y, k);
+                }
+            }
+            "k" => {
+                if let (Some(c), Some(m), Some(y), Some(k)) = (
+                    obj_to_f32(args.first()),
+                    obj_to_f32(args.get(1)),
+                    obj_to_f32(args.get(2)),
+                    obj_to_f32(args.get(3)),
+                ) {
+                    state.fill_color = cmyk_to_color(c, m, y, k);
+                }
+            }
+            "SC" | "SCN" => {
+                if let Some(col) = parse_generic_color(args) {
+                    state.stroke_color = col;
+                }
+            }
+            "sc" | "scn" => {
+                if let Some(col) = parse_generic_color(args) {
+                    state.fill_color = col;
+                }
+            }
+
+            // ================================================================
+            // ПОСТРОЕНИЕ ВЕКТОРНЫХ ПУТЕЙ (m, l, c, v, y, h, re)
+            // ================================================================
+            "m" => {
+                if let (Some(x), Some(y)) = (obj_to_f32(args.first()), obj_to_f32(args.get(1))) {
+                    let (px, py) = state.ctm.map_point(x, y);
+                    pb.move_to(px, py);
+                    cur_pt = (px, py);
+                    subpath_start = (px, py);
+                    has_path = true;
+                }
+            }
+            "l" => {
+                if let (Some(x), Some(y)) = (obj_to_f32(args.first()), obj_to_f32(args.get(1))) {
+                    let (px, py) = state.ctm.map_point(x, y);
+                    if !has_path {
+                        pb.move_to(px, py);
+                        subpath_start = (px, py);
+                        has_path = true;
+                    } else {
+                        pb.line_to(px, py);
+                    }
+                    cur_pt = (px, py);
+                }
+            }
+            "c" => {
+                if args.len() >= 6 {
+                    if let (Some(x1), Some(y1), Some(x2), Some(y2), Some(x3), Some(y3)) = (
+                        obj_to_f32(args.first()),
+                        obj_to_f32(args.get(1)),
+                        obj_to_f32(args.get(2)),
+                        obj_to_f32(args.get(3)),
+                        obj_to_f32(args.get(4)),
+                        obj_to_f32(args.get(5)),
+                    ) {
+                        let (p1x, p1y) = state.ctm.map_point(x1, y1);
+                        let (p2x, p2y) = state.ctm.map_point(x2, y2);
+                        let (p3x, p3y) = state.ctm.map_point(x3, y3);
+                        pb.cubic_to(p1x, p1y, p2x, p2y, p3x, p3y);
+                        cur_pt = (p3x, p3y);
+                        has_path = true;
+                    }
+                }
+            }
+            "v" => {
+                if args.len() >= 4 {
+                    if let (Some(x2), Some(y2), Some(x3), Some(y3)) = (
+                        obj_to_f32(args.first()),
+                        obj_to_f32(args.get(1)),
+                        obj_to_f32(args.get(2)),
+                        obj_to_f32(args.get(3)),
+                    ) {
+                        let (p2x, p2y) = state.ctm.map_point(x2, y2);
+                        let (p3x, p3y) = state.ctm.map_point(x3, y3);
+                        pb.cubic_to(cur_pt.0, cur_pt.1, p2x, p2y, p3x, p3y);
+                        cur_pt = (p3x, p3y);
+                        has_path = true;
+                    }
+                }
+            }
+            "y" => {
+                if args.len() >= 4 {
+                    if let (Some(x1), Some(y1), Some(x3), Some(y3)) = (
+                        obj_to_f32(args.first()),
+                        obj_to_f32(args.get(1)),
+                        obj_to_f32(args.get(2)),
+                        obj_to_f32(args.get(3)),
+                    ) {
+                        let (p1x, p1y) = state.ctm.map_point(x1, y1);
+                        let (p3x, p3y) = state.ctm.map_point(x3, y3);
+                        pb.cubic_to(p1x, p1y, p3x, p3y, p3x, p3y);
+                        cur_pt = (p3x, p3y);
+                        has_path = true;
+                    }
+                }
+            }
+            "h" => {
+                if has_path {
+                    pb.close();
+                    cur_pt = subpath_start;
+                }
+            }
+            "re" => {
+                if args.len() >= 4 {
+                    if let (Some(x), Some(y), Some(w), Some(h)) = (
+                        obj_to_f32(args.first()),
+                        obj_to_f32(args.get(1)),
+                        obj_to_f32(args.get(2)),
+                        obj_to_f32(args.get(3)),
+                    ) {
+                        let p0 = state.ctm.map_point(x, y);
+                        let p1 = state.ctm.map_point(x + w, y);
+                        let p2 = state.ctm.map_point(x + w, y + h);
+                        let p3 = state.ctm.map_point(x, y + h);
+
+                        pb.move_to(p0.0, p0.1);
+                        pb.line_to(p1.0, p1.1);
+                        pb.line_to(p2.0, p2.1);
+                        pb.line_to(p3.0, p3.1);
+                        pb.close();
+                        cur_pt = p0;
+                        subpath_start = p0;
+                        has_path = true;
+                    }
+                }
+            }
+
+            // ================================================================
+            // ОТРИСОВКА ПУТЕЙ: ОБВОДКА И ЗАЛИВКА (S, s, f, F, f*, B, B*, b, b*, n)
+            // ================================================================
+            "S" => {
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        stroke_pdf_path(pixmap, &path, state);
+                    }
+                }
+                has_path = false;
+            }
+            "s" => {
+                pb.close();
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        stroke_pdf_path(pixmap, &path, state);
+                    }
+                }
+                has_path = false;
+            }
+            "f" | "F" => {
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        fill_pdf_path(pixmap, &path, state, FillRule::Winding);
+                    }
+                }
+                has_path = false;
+            }
+            "f*" => {
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        fill_pdf_path(pixmap, &path, state, FillRule::EvenOdd);
+                    }
+                }
+                has_path = false;
+            }
+            "B" => {
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        fill_pdf_path(pixmap, &path, state, FillRule::Winding);
+                        stroke_pdf_path(pixmap, &path, state);
+                    }
+                }
+                has_path = false;
+            }
+            "B*" => {
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        fill_pdf_path(pixmap, &path, state, FillRule::EvenOdd);
+                        stroke_pdf_path(pixmap, &path, state);
+                    }
+                }
+                has_path = false;
+            }
+            "b" => {
+                pb.close();
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        fill_pdf_path(pixmap, &path, state, FillRule::Winding);
+                        stroke_pdf_path(pixmap, &path, state);
+                    }
+                }
+                has_path = false;
+            }
+            "b*" => {
+                pb.close();
+                let current_pb = std::mem::replace(&mut pb, PathBuilder::new());
+                if has_path {
+                    if let Some(path) = current_pb.finish() {
+                        fill_pdf_path(pixmap, &path, state, FillRule::EvenOdd);
+                        stroke_pdf_path(pixmap, &path, state);
+                    }
+                }
+                has_path = false;
+            }
+            "n" => {
+                pb = PathBuilder::new();
+                has_path = false;
+            }
+
+            // ================================================================
+            // ОТРИСОВКА ОБЪЕКТОВ XOBJECT (Do): КАРТИНКИ И ВЛОЖЕННЫЕ ЧЕРТЕЖИ
+            // ================================================================
+            "Do" => {
+                if let Some(Ok(name)) = args.first().map(|o| o.as_name()) {
+                    draw_xobject(doc, resources, name, pixmap, state, state_stack, depth);
+                }
+            }
+
+            // ================================================================
+            // ТЕКСТОВЫЕ ОПЕРАТОРЫ (BT, ET, Tf, Tm, Td, TD, T*, TL, Tj, TJ)
+            // ================================================================
+            "BT" => {
+                state.text_matrix = Affine2D::identity();
+                state.text_line_matrix = Affine2D::identity();
+            }
+            "Tf" => {
+                if let Some(sz) = obj_to_f32(args.get(1)) {
+                    if sz.abs() > 0.1 {
+                        state.font_size = sz.abs();
+                    }
+                }
+            }
+            "TL" => {
+                if let Some(leading) = obj_to_f32(args.first()) {
+                    state.text_leading = leading;
+                }
+            }
+            "Tm" => {
+                if let Some(m) = parse_matrix(args) {
+                    state.text_matrix = m;
+                    state.text_line_matrix = m;
+                }
+            }
+            "Td" => {
+                if let (Some(tx), Some(ty)) = (obj_to_f32(args.first()), obj_to_f32(args.get(1))) {
+                    let trans = Affine2D {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 1.0,
+                        e: tx,
+                        f: ty,
+                    };
+                    state.text_line_matrix = state.text_line_matrix.pre_concat(trans);
+                    state.text_matrix = state.text_line_matrix;
+                }
+            }
+            "TD" => {
+                if let (Some(tx), Some(ty)) = (obj_to_f32(args.first()), obj_to_f32(args.get(1))) {
+                    state.text_leading = -ty;
+                    let trans = Affine2D {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 1.0,
+                        e: tx,
+                        f: ty,
+                    };
+                    state.text_line_matrix = state.text_line_matrix.pre_concat(trans);
+                    state.text_matrix = state.text_line_matrix;
+                }
+            }
+            "T*" => {
+                let trans = Affine2D {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: 0.0,
+                    f: -state.text_leading,
+                };
+                state.text_line_matrix = state.text_line_matrix.pre_concat(trans);
+                state.text_matrix = state.text_line_matrix;
+            }
+            "Tj" | "TJ" | "'" | "\"" => {
+                draw_pdf_text_operation(pixmap, state, args);
+            }
+
+            _ => {}
+        }
+    }
+}
+
+fn stroke_pdf_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, state: &PdfGraphicsState) {
+    let mut paint = Paint::default();
+    paint.set_color(state.stroke_color);
+    paint.anti_alias = true;
+
+    let scale = state.ctm.scale_factor();
+    // Даже очень тонкие линии чертежа (0.05 pt) делаем минимум 1 пиксель, чтобы они были чётко видны VLM
+    let pixel_width = (state.line_width * scale).clamp(1.0, 25.0);
+
+    let mut stroke = Stroke {
+        width: pixel_width,
+        line_cap: state.line_cap,
+        line_join: state.line_join,
+        ..Default::default()
+    };
+
+    if state.dash_array.len() >= 2 {
+        let scaled_dashes: Vec<f32> = state
+            .dash_array
+            .iter()
+            .map(|&d| (d * scale).max(1.0))
+            .collect();
+        stroke.dash = StrokeDash::new(scaled_dashes, state.dash_phase * scale);
+    }
+
+    pixmap.stroke_path(path, &paint, &stroke, Transform::identity(), None);
+}
+
+fn fill_pdf_path(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    state: &PdfGraphicsState,
+    rule: FillRule,
+) {
+    let mut paint = Paint::default();
+    paint.set_color(state.fill_color);
+    paint.anti_alias = true;
+
+    pixmap.fill_path(path, &paint, rule, Transform::identity(), None);
+}
+
+/// Отрисовывает XObject (`/Image` или вложенный векторный `/Form`) на холст страницы
+fn draw_xobject(
+    doc: &Document,
+    resources: Option<&Dictionary>,
+    xobj_name: &[u8],
+    pixmap: &mut Pixmap,
+    state: &mut PdfGraphicsState,
+    state_stack: &mut Vec<PdfGraphicsState>,
+    depth: u8,
+) {
+    let Some(res) = resources else {
+        return;
+    };
+
+    let xobj_dict = match res.get(b"XObject") {
+        Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
+        Ok(Object::Dictionary(d)) => Some(d),
+        _ => None,
+    };
+
+    let Some(xobjects) = xobj_dict else {
+        return;
+    };
+
+    let Ok(Object::Reference(target_id)) = xobjects.get(xobj_name) else {
+        return;
+    };
+
+    let Ok(Object::Stream(stream)) = doc.get_object(*target_id) else {
+        return;
+    };
+
+    let subtype = stream
+        .dict
+        .get(b"Subtype")
+        .and_then(|o| o.as_name())
+        .unwrap_or(b"");
+
+    if subtype == b"Image" {
+        // Декодируем изображение и размещаем его в единичном квадрате [0..1, 0..1] текущей CTM
+        if let Some(dyn_img) = decode_pdf_image_to_dynamic(doc, stream, 4) {
+            let rgba = dyn_img.to_rgba8();
+            let img_w = rgba.width();
+            let img_h = rgba.height();
+            if img_w == 0 || img_h == 0 {
+                return;
+            }
+
+            // В tiny-skia используется premultiplied RGBA
+            let mut premul_bytes = rgba.into_raw();
+            for px in premul_bytes.chunks_exact_mut(4) {
+                let a = px[3] as u16;
+                if a < 255 {
+                    px[0] = ((px[0] as u16 * a) / 255) as u8;
+                    px[1] = ((px[1] as u16 * a) / 255) as u8;
+                    px[2] = ((px[2] as u16 * a) / 255) as u8;
+                }
+            }
+
+            if let Some(sub_pixmap) = PixmapRef::from_bytes(&premul_bytes, img_w, img_h) {
+                // В PDF картинка рисуется в квадрате (0,0)..(1,1), где (0,1) — верхний левый угол
+                let img_to_unit_square = Affine2D {
+                    a: 1.0 / (img_w as f32),
+                    b: 0.0,
+                    c: 0.0,
+                    d: -1.0 / (img_h as f32),
+                    e: 0.0,
+                    f: 1.0,
+                };
+                let full_matrix = state.ctm.pre_concat(img_to_unit_square);
+
+                if let Some(skia_transform) = full_matrix.to_skia_transform() {
+                    let paint = PixmapPaint {
+                        quality: FilterQuality::Bilinear,
+                        ..Default::default()
+                    };
+                    pixmap.draw_pixmap(0, 0, sub_pixmap, &paint, skia_transform, None);
+                }
+            }
+        }
+    } else if subtype == b"Form" {
+        // Рекурсивная отрисовка векторного контейнера Form XObject
+        let saved_state = state.clone();
+
+        if let Ok(Object::Array(mat_arr)) = stream.dict.get(b"Matrix") {
+            if let Some(form_mat) = parse_matrix(mat_arr) {
+                state.ctm = state.ctm.pre_concat(form_mat);
+            }
+        }
+
+        let form_resources = match stream.dict.get(b"Resources") {
+            Ok(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
+            Ok(Object::Dictionary(d)) => Some(d),
+            _ => None,
+        }
+        .or(resources);
+
+        if let Ok(decompressed) = stream.decompressed_content() {
+            if let Ok(form_content) = Content::decode(&decompressed) {
+                render_operations(
+                    doc,
+                    &form_content.operations,
+                    form_resources,
+                    pixmap,
+                    state,
+                    state_stack,
+                    depth + 1,
+                );
+            }
+        }
+
+        *state = saved_state;
+    }
+}
+
+/// Отрисовывает текст на холсте через ab_glyph (если доступен системный TTF-шрифт)
+fn draw_pdf_text_operation(pixmap: &mut Pixmap, state: &mut PdfGraphicsState, args: &[Object]) {
+    let Some(font) = get_optional_font() else {
+        return;
+    };
+
+    let mut extracted = String::new();
+    for arg in args {
+        collect_strings_from_object(arg, &mut extracted);
+    }
+
+    let text = extracted.trim();
+    if text.is_empty() {
+        return;
+    }
+
+    let combined = state.ctm.pre_concat(state.text_matrix);
+    let (mut pen_x, pen_y) = combined.map_point(0.0, 0.0);
+    let px_size = (state.font_size * combined.scale_factor()).clamp(8.0, 72.0);
+
+    let scaled_font = font.as_scaled(PxScale::from(px_size));
+    let width_limit = pixmap.width() as i32;
+    let height_limit = pixmap.height() as i32;
+    let pixels = pixmap.data_mut();
+
+    let r_fg = (state.fill_color.red() * 255.0) as u8;
+    let g_fg = (state.fill_color.green() * 255.0) as u8;
+    let b_fg = (state.fill_color.blue() * 255.0) as u8;
+
+    for ch in text.chars() {
+        let glyph_id = scaled_font.glyph_id(ch);
+        let glyph = glyph_id.with_scale_and_position(
+            PxScale::from(px_size),
+            ab_glyph::point(pen_x, pen_y),
+        );
+        pen_x += scaled_font.h_advance(glyph_id);
+
+        if let Some(outlined) = scaled_font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, coverage| {
+                if coverage < 0.05 {
+                    return;
+                }
+                let px = bounds.min.x as i32 + gx as i32;
+                let py = bounds.min.y as i32 + gy as i32;
+                if px >= 0 && px < width_limit && py >= 0 && py < height_limit {
+                    let idx = ((py as usize) * (width_limit as usize) + (px as usize)) * 4;
+                    let inv = 1.0 - coverage;
+                    pixels[idx] = (r_fg as f32 * coverage + pixels[idx] as f32 * inv) as u8;
+                    pixels[idx + 1] = (g_fg as f32 * coverage + pixels[idx + 1] as f32 * inv) as u8;
+                    pixels[idx + 2] = (b_fg as f32 * coverage + pixels[idx + 2] as f32 * inv) as u8;
+                    pixels[idx + 3] = 255;
+                }
+            });
+        }
+    }
+}
+
+fn collect_strings_from_object(obj: &Object, out: &mut String) {
+    match obj {
+        Object::String(bytes, _) => {
+            if bytes.starts_with(&[0xFE, 0xFF]) && bytes.len() >= 4 {
+                // UTF-16BE строка в PDF
+                let u16_words: Vec<u16> = bytes[2..]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                if let Ok(s) = String::from_utf16(&u16_words) {
+                    out.push_str(&s);
+                }
+            } else {
+                out.push_str(&String::from_utf8_lossy(bytes));
+            }
+        }
+        Object::Array(arr) => {
+            for item in arr {
+                collect_strings_from_object(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn get_page_media_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
+    let mut cur_id = Some(page_id);
+    for _ in 0..8 {
+        let id = cur_id?;
+        let dict = doc.get_dictionary(id).ok()?;
+
+        for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
+            if let Ok(obj) = dict.get(key) {
+                let resolved = doc.dereference(obj).map(|(_, o)| o).unwrap_or(obj);
+                if let Object::Array(arr) = resolved {
+                    if arr.len() >= 4 {
+                        let x0 = obj_to_f32(arr.first())?;
+                        let y0 = obj_to_f32(arr.get(1))?;
+                        let x1 = obj_to_f32(arr.get(2))?;
+                        let y1 = obj_to_f32(arr.get(3))?;
+                        return Some((x0, y0, x1, y1));
+                    }
+                }
+            }
+        }
+
+        cur_id = dict.get(b"Parent").and_then(|o| o.as_reference()).ok();
+    }
+    None
+}
+
+fn get_page_resources(doc: &Document, page_id: ObjectId) -> Option<&Dictionary> {
+    let mut cur_id = Some(page_id);
+    for _ in 0..8 {
+        let id = cur_id?;
+        let dict = doc.get_dictionary(id).ok()?;
+
+        if let Ok(res_obj) = dict.get(b"Resources") {
+            match res_obj {
+                Object::Reference(res_id) => {
+                    if let Ok(d) = doc.get_dictionary(*res_id) {
+                        return Some(d);
+                    }
+                }
+                Object::Dictionary(d) => return Some(d),
+                _ => {}
+            }
+        }
+
+        cur_id = dict.get(b"Parent").and_then(|o| o.as_reference()).ok();
+    }
+    None
+}
+
+fn parse_matrix(args: &[Object]) -> Option<Affine2D> {
+    if args.len() < 6 {
+        return None;
+    }
+    Some(Affine2D {
+        a: obj_to_f32(args.first())?,
+        b: obj_to_f32(args.get(1))?,
+        c: obj_to_f32(args.get(2))?,
+        d: obj_to_f32(args.get(3))?,
+        e: obj_to_f32(args.get(4))?,
+        f: obj_to_f32(args.get(5))?,
+    })
+}
+
+fn obj_to_f32(obj: Option<&Object>) -> Option<f32> {
+    match obj? {
+        Object::Integer(i) => Some(*i as f32),
+        Object::Real(r) => Some(*r as f32),
+        _ => None,
+    }
+}
+
+fn obj_to_i64(obj: Option<&Object>) -> Option<i64> {
+    match obj? {
+        Object::Integer(i) => Some(*i),
+        Object::Real(r) => Some(*r as i64),
+        _ => None,
+    }
+}
+
+fn gray_to_color(g: f32) -> Color {
+    let v = (g.clamp(0.0, 1.0) * 255.0) as u8;
+    Color::from_rgba8(v, v, v, 255)
+}
+
+fn rgb_to_color(r: f32, g: f32, b: f32) -> Color {
+    Color::from_rgba8(
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
+        255,
+    )
+}
+
+fn cmyk_to_color(c: f32, m: f32, y: f32, k: f32) -> Color {
+    let c = c.clamp(0.0, 1.0);
+    let m = m.clamp(0.0, 1.0);
+    let y = y.clamp(0.0, 1.0);
+    let k = k.clamp(0.0, 1.0);
+
+    let r = ((1.0 - c) * (1.0 - k) * 255.0) as u8;
+    let g = ((1.0 - m) * (1.0 - k) * 255.0) as u8;
+    let b = ((1.0 - y) * (1.0 - k) * 255.0) as u8;
+    Color::from_rgba8(r, g, b, 255)
+}
+
+fn parse_generic_color(args: &[Object]) -> Option<Color> {
+    let nums: Vec<f32> = args.iter().filter_map(|o| obj_to_f32(Some(o))).collect();
+    match nums.len() {
+        1 => Some(gray_to_color(nums[0])),
+        3 => Some(rgb_to_color(nums[0], nums[1], nums[2])),
+        4 => Some(cmyk_to_color(nums[0], nums[1], nums[2], nums[3])),
+        _ => None,
+    }
+}
